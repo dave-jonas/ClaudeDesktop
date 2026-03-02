@@ -1,6 +1,11 @@
 # Claude Desktop — Intune Deployment
 
-This repo contains everything needed to deploy Claude Desktop across Jonas BUs using Microsoft Intune. It covers the Win32 app package, enterprise registry policy, and detection/uninstall scripts.
+This repo provides a more formal and detailed deployment guide than the official Anthropic documentation, covering Win32 app packaging, enterprise registry policy, and detection/uninstall scripts for deploying Claude Desktop system-wide via Microsoft Intune.
+
+> **Work in progress — this deployment approach is still being tested. Always check Anthropic's official documentation as the authoritative reference, as guidance is likely to improve over time.**
+>
+> - [Deploy Claude Desktop for Windows](https://support.claude.com/en/articles/12622703-deploy-claude-desktop-for-windows)
+> - [Enterprise configuration](https://support.claude.com/en/articles/12622667-enterprise-configuration)
 
 ---
 
@@ -8,7 +13,7 @@ This repo contains everything needed to deploy Claude Desktop across Jonas BUs u
 
 | File | Purpose |
 |---|---|
-| `install_claude.ps1` | Enables Virtual Machine Platform, applies registry policy, provisions the MSIX |
+| `install_claude.ps1` | Enables Virtual Machine Platform, provisions the MSIX system-wide |
 | `detect_claude.ps1` | Detection script for Intune |
 | `uninstall_claude.ps1` | Removes and deprovisions Claude for all users |
 | `claude-desktop-intune-policy.json` | Intune custom configuration profile (OMA-URI) |
@@ -126,6 +131,8 @@ The policy writes the following registry keys to `HKLM\SOFTWARE\Policies\Claude`
 
 Review `isLocalDevMcpEnabled` and `isClaudeCodeForDesktopEnabled` before deploying to general staff. Both are on by default but explicitly setting them in policy locks the value so users and apps cannot override it.
 
+> Check the [enterprise configuration reference](https://support.claude.com/en/articles/12622667-enterprise-configuration) for the current full list of supported policy keys, as Anthropic may add or change settings over time.
+
 ---
 
 ## Notes on Virtual Machine Platform
@@ -157,10 +164,3 @@ To verify Claude is provisioned:
 ```powershell
 Get-AppxProvisionedPackage -Online | Where-Object { $_.DisplayName -like "*Claude*" }
 ```
-
----
-
-## Maintained by
-
-Jonas Software AUS — IT Security  
-Contact: David Carroll, CISO
