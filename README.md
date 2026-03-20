@@ -243,12 +243,13 @@ The `claude_admx/` folder contains ADMX and ADML policy templates for managing C
 
 **To use with Intune (recommended):**
 
-1. Go to **Devices > Configuration profiles > Create > New policy**
-2. Platform: **Windows 10 and later**, Profile type: **Templates > Imported Administrative templates**
-3. Import `claude_admx.admx` and `claude_adml.adml`
-4. Configure the desired policy settings and assign to a device group
+The process requires importing the ADMX files into Intune first, then creating a policy that references them — it is a two-step process. Follow Microsoft's official documentation for the current steps:
 
-> If the ADMX templates in this repo are updated to add new policy settings, re-import both files into the same Intune profile. Existing configured settings are preserved.
+> [Use Windows 10/11 templates to configure group policy settings in Microsoft Intune](https://learn.microsoft.com/en-us/mem/intune/configuration/administrative-templates-windows)
+
+Import `claude_admx.admx` and `claude_adml.adml` from the `claude_admx/` folder. Once imported, create a configuration profile using the imported template and configure the desired policy settings.
+
+> If the ADMX templates in this repo are updated to add new policy settings, re-import both files and update your profile accordingly. Existing configured settings are preserved.
 
 **To use with traditional Group Policy**, copy to your Central Store:
 
