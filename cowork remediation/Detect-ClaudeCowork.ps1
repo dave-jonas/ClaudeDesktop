@@ -24,10 +24,15 @@
                      Structured key=value format, one summary line + one issues line.
                      Visible in Intune admin centre: Devices > Remediations > [script] > Device status.
 .NOTES
-    Version:    1.6
+    Version:    1.7
     Date:       2026-03
     Author:     David Carroll - Jonas Software Australia
     Scope:      Windows 11 Pro, Claude Desktop MSIX, Intune-managed devices
+    Changes v1.7:
+      - CHECK2: Removed vmms from service checks. Cowork only requires vmcompute;
+        vmms (Hyper-V Manager stack) is not needed and was causing false positives
+        on working devices where vmcompute runs without vmms.
+      - CHECK0b: Use vmcompute (not vmms) as the signal for Hyper-V being present.
     Changes v1.5:
       - CHECK 0b: Guest VM detection now requires integration services to be RUNNING, not just exist.
         After enabling Hyper-V on a bare-metal host, vmicXXX services are created but stopped —
