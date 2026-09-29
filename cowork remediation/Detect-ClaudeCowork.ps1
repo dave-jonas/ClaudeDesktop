@@ -3,53 +3,53 @@
 .SYNOPSIS
     Detection script for Claude Cowork prerequisites (Intune Remediation)
 .DESCRIPTION
-    Checks VM infrastructure prerequisites required before Claude Desktop is installed.
-    Exits 0 if everything is healthy (no remediation needed) and writes the prereqs flag.
-    Exits 1 if any check fails (triggers remediation script).
-    Designed to run as SYSTEM via Intune Remediations.
+    Checks VM infrastructure prerequisites for the Claude Desktop Cowork feature.
+    Exits 0 (COMPLIANT) only when prereqs are truly READY (features enabled +
+    vmcompute + HNS running, no blocking condition) and writes ClaudePrereqsReady.flag.
+    Exits 1 (NON-COMPLIANT) otherwise, which triggers Remediate-ClaudeCowork.ps1.
+    Runs as SYSTEM via Intune Remediations. Paired with Remediate-ClaudeCowork.ps1 (v2.1).
 
-    Checks cover only VM infrastructure (Hyper-V features, services, subnet conflicts).
-    Post-install checks (CoworkVMService, HNS network, WinNAT, VHDX files) are
-    intentionally excluded — they cannot pass before Claude is installed and would
-    permanently block the prereqs flag from being written.
+    v2.0 alignment with the state-machine remediation:
+      - GATE 0 no longer false-fails "BIOS off" just because HypervisorPresent=False.
+        It only reports firmware-disabled when VirtualizationFirmwareEnabled is
+        explicitly False. A device that simply has not enabled Hyper-V yet is reported
+        as an ordinary (remediable) non-compliance, not a dead-end BIOS gate.
+      - REBOOT-PENDING AWARENESS: when features are enabled but services are not yet
+        present and a servicing reboot is pending, the issue is phrased as the expected
+        "awaiting reboot" stage (still non-compliant, so remediation completes it after
+        the reboot) rather than a raw service failure.
+      - BLOCKED PASSTHROUGH: if remediation latched a store-corruption block
+        (ClaudeCowork-Blocked.flag), detection surfaces STATUS=BLOCKED and stays
+        non-compliant so the device is visible for manual repair. Remediation itself
+        stops re-running dism; detection does not clear the latch.
+
+    Post-install checks (CoworkVMService, WinNAT, DNS, VHDX files) are intentionally
+    excluded -- they cannot pass before Claude is installed and would permanently block
+    the prereqs flag.
 
     Logging strategy (three layers):
       1. File log   -  C:\ProgramData\Microsoft\IntuneManagementExtension\Logs\Claude\ClaudeCowork-Detection.log
-                     Detailed timestamped log. Automatically collected by Intune > Collect diagnostics
-                     because it lives inside the IME Logs directory.
       2. Event log  -  Windows Application log, Source "ClaudeCoworkMSIX"
-                     EventID 1000 = compliant, EventID 1001 = non-compliant.
-                     Queryable via Log Analytics if MMA/AMA is deployed to endpoints.
-      3. stdout     -  Write-Host output captured by Intune Remediations reporting blade.
-                     Structured key=value format, one summary line + one issues line.
-                     Visible in Intune admin centre: Devices > Remediations > [script] > Device status.
+                     EventID 1000 = compliant, 1001 = non-compliant, 1004 = blocked.
+      3. stdout     -  Structured key=value captured by the Intune Remediations blade.
 .NOTES
-    Version:    1.7
-    Date:       2026-03
-    Author:     David Carroll - Jonas Software Australia
-    Scope:      Windows 11 Pro, Claude Desktop MSIX, Intune-managed devices
-    Changes v1.7:
-      - CHECK2: Removed vmms from service checks. Cowork only requires vmcompute;
-        vmms (Hyper-V Manager stack) is not needed and was causing false positives
-        on working devices where vmcompute runs without vmms.
-      - CHECK0b: Use vmcompute (not vmms) as the signal for Hyper-V being present.
-    Changes v1.5:
-      - CHECK 0b: Guest VM detection now requires integration services to be RUNNING, not just exist.
-        After enabling Hyper-V on a bare-metal host, vmicXXX services are created but stopped —
-        previously this caused the host to be misidentified as a guest VM on the post-reboot cycle.
-    Changes v1.4:
-      - Removed CHECK3 (CoworkVMService), CHECK4-6 (HNS/WinNAT/DNS), CHECK7 (VHDX integrity)
-        These are post-install/post-first-run checks that cannot pass before Claude is installed.
-        Keeping them caused the prereqs flag to never be written on fresh machines.
-      - Flag is now written by detection (exit 0) not remediation, so install_claude.ps1
-        only proceeds once VM infrastructure is confirmed healthy.
-    Changes v1.3:
-      - CHECK7: Removed rootfs.vhdx minimum size threshold (version-dependent; breaks on Anthropic updates)
-    Changes v1.2:
-      - CHECK0b: Detect guest VM without nested virtualisation (previously misidentified as vmms failure)
-      - CHECK1b: Full Hyper-V feature stack (Microsoft-Hyper-V, -Services, -Hypervisor)  -  not just VirtualMachinePlatform
-      - CHECK2b: HNS service  -  required for cowork-vm-nat network creation
-      - CHECK7: Extended to cover rootfs.vhdx and smol-bin.vhdx (not just sessiondata.vhdx)
+    Version:    2.1
+    Date:       2026-07
+    Author:     David Carroll - Jonas Software Australia (v2.0 alignment: Claude)
+    Scope:      Windows 11 Pro/Enterprise, Claude Desktop, Intune-managed devices
+
+    Changes v2.1:
+      - When COMPLIANT, remove the stale ClaudeCowork-RebootPending.flag and unregister
+        the user-context reboot-prompt task + script. Runs as SYSTEM, so it reliably
+        cleans up devices that converged via detection alone (remediation never re-ran
+        CASE A), preventing the reboot-prompt from force-restarting off a leftover flag.
+
+    Changes v2.0:
+      - GATE 0 corrected (see above): distinguishes firmware-off from not-yet-enabled.
+      - Reboot-pending awareness for feature/service checks.
+      - Blocked (store-corruption) passthrough, mirroring remediation v2.1.
+      - Shared Test-PendingReboot helper so detection and remediation agree on state.
+    (Earlier changelog v1.2-v1.7 retained in git history.)
 #>
 
 # ===========================================================================
@@ -59,15 +59,16 @@ $LogDir      = "$env:ProgramData\Microsoft\IntuneManagementExtension\Logs\Claude
 $LogFile     = "$LogDir\ClaudeCowork-Detection.log"
 $EventSource = "ClaudeCoworkMSIX"
 $EventLog    = "Application"
+$FlagFile          = "$LogDir\ClaudePrereqsReady.flag"
+$RebootPendingFlag = "$LogDir\ClaudeCowork-RebootPending.flag"
+$BlockedFlag       = "$LogDir\ClaudeCowork-Blocked.flag"
 
 if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 
-# Rotate log file if over 5 MB
 if ((Test-Path $LogFile) -and (Get-Item $LogFile).Length -gt 5MB) {
     Rename-Item -Path $LogFile -NewName "$LogFile.bak" -Force -ErrorAction SilentlyContinue
 }
 
-# Register Event Log source (SYSTEM has rights to do this)
 if (-not [System.Diagnostics.EventLog]::SourceExists($EventSource)) {
     try { New-EventLog -LogName $EventLog -Source $EventSource -ErrorAction Stop } catch {}
 }
@@ -78,210 +79,215 @@ function Write-Log {
     "$ts [$Level] $Message" | Out-File -FilePath $LogFile -Append -Encoding UTF8
 }
 
+function Test-PendingReboot {
+    # Same signals as the remediation, so both scripts agree on "reboot pending".
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { return $true }
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { return $true }
+    if (Test-Path $RebootPendingFlag) { return $true }
+    return $false
+}
+
+function Get-FeatureState {
+    param([string]$Name)
+    try { return (Get-WindowsOptionalFeature -Online -FeatureName $Name -ErrorAction Stop).State } catch { return 'Unknown' }
+}
+
 Write-Log "========================================="
-Write-Log "Claude Cowork detection started (v1.5)"
+Write-Log "Claude Cowork detection started (v2.1)"
 Write-Log "Host: $env:COMPUTERNAME | OS: $([System.Environment]::OSVersion.VersionString)"
 Write-Log "========================================="
 
-# $issues   = failures that trigger remediation
-# $checks   = structured key=value results for Intune stdout
+# $issues = failures that trigger remediation ; $checks = key=value results for stdout
 $issues = [System.Collections.Generic.List[string]]::new()
 $checks = [System.Collections.Generic.List[string]]::new()
 
-# Helper to emit to Intune portal (called once at the end)
 function Write-IntuneOutput {
-    param([int]$IssueCount, [string[]]$CheckResults, [string[]]$IssueList)
-    $status = if ($IssueCount -gt 0) { "NON-COMPLIANT" } else { "COMPLIANT" }
+    param([int]$IssueCount, [string[]]$CheckResults, [string[]]$IssueList, [string]$StatusOverride)
+    $status = if ($StatusOverride) { $StatusOverride } elseif ($IssueCount -gt 0) { "NON-COMPLIANT" } else { "COMPLIANT" }
     Write-Host "STATUS=$status|ISSUE_COUNT=$IssueCount|$($CheckResults -join '|')"
     if ($IssueCount -gt 0) {
         Write-Host "ISSUES: $($IssueList -join ' || ')"
     }
 }
 
+$pendingReboot = Test-PendingReboot
+Write-Log "pendingReboot = $pendingReboot"
+
 # ===========================================================================
-# CHECK 0: Hypervisor present (confirms firmware VT-x/AMD-V is enabled)
+# CHECK -1: Windows 365 Cloud PC skip
 #
-# Gate check. If HypervisorPresent is false, firmware virt is off  -  BIOS
-# intervention required. Exit early to avoid cascading false failures.
+# Cloud PC SKUs below 8vCPU/32GB cannot do nested virtualisation. Report
+# COMPLIANT and write the flag so Claude installs (without Cowork).
 # ===========================================================================
-Write-Log "--- CHECK 0: Hypervisor present (firmware VT-x/AMD-V)"
+Write-Log "--- CHECK -1: Cloud PC detection"
+try {
+    $model = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).Model
+    if ($model -like "Cloud PC*") {
+        Write-Log "Cloud PC detected (model: $model). Skipping Cowork prereqs. Writing flag so Claude installs without Cowork."
+        $checks.Add("CHECK-1_CLOUDPC=SKIP:$model")
+        if (-not (Test-Path $FlagFile)) {
+            "Cloud PC ($model)  -  Cowork prereqs skipped on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') by $env:COMPUTERNAME" |
+                Out-File -FilePath $FlagFile -Encoding UTF8
+            Write-Log "FLAG WRITTEN: $FlagFile"
+        }
+        try {
+            Write-EventLog -LogName $EventLog -Source $EventSource -EventId 1000 -EntryType Information `
+                -Message "Claude Cowork prereqs SKIPPED on Cloud PC $env:COMPUTERNAME (model: $model)." -ErrorAction SilentlyContinue
+        } catch {}
+        Write-IntuneOutput -IssueCount 0 -CheckResults $checks -IssueList $issues
+        Exit 0
+    }
+    Write-Log "Not a Cloud PC (model: $model). Continuing checks."
+} catch {
+    Write-Log "WARN: Cloud PC model query failed  -  $_. Continuing." "WARN"
+}
+
+# ===========================================================================
+# CHECK -0: BLOCKED latch (store corruption) passthrough
+#
+# Remediation writes ClaudeCowork-Blocked.flag when DISM reports the component
+# store is corrupt. That is not fixable by feature enablement -- surface it and
+# stay NON-COMPLIANT so the device is visible for manual repair. Detection does
+# NOT clear the latch (only manual repair + remediation reaching READY does).
+# ===========================================================================
+Write-Log "--- CHECK -0: Blocked latch"
+if (Test-Path $BlockedFlag) {
+    $blockedSince = (Get-Content $BlockedFlag -ErrorAction SilentlyContinue | Select-Object -First 1)
+    Write-Log "BLOCKED latch present ($blockedSince). Component store corruption reported by remediation." "ERROR"
+    $checks.Add("CHECK-0_BLOCKED=StoreCorrupt")
+    $issues.Add("BLOCKED: Component store corruption latched. Manual repair required (DISM /RestoreHealth, in-place upgrade, or Reset), then delete $BlockedFlag.")
+    try {
+        Write-EventLog -LogName $EventLog -Source $EventSource -EventId 1004 -EntryType Error `
+            -Message "Claude Cowork BLOCKED on $env:COMPUTERNAME. Store corruption latched. Manual repair required." -ErrorAction SilentlyContinue
+    } catch {}
+    Write-IntuneOutput -IssueCount $issues.Count -CheckResults $checks -IssueList $issues -StatusOverride "BLOCKED"
+    Exit 1
+}
+
+# ===========================================================================
+# CHECK 0: Firmware virtualisation (VT-x/AMD-V)
+#
+# v2.0: only report firmware-disabled when it is CONFIRMED (HypervisorPresent
+# False AND VirtualizationFirmwareEnabled explicitly False). "Hyper-V not enabled
+# yet" (HypervisorPresent False but firmware virt available) is a normal remediable
+# state and must NOT be reported as a BIOS dead-end.
+# ===========================================================================
+Write-Log "--- CHECK 0: Firmware virtualisation (VT-x/AMD-V)"
 try {
     $cs = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
     if ($cs.HypervisorPresent -eq $true) {
         Write-Log "PASS: HypervisorPresent = True"
         $checks.Add("CHECK0_HYPERVISOR=PASS")
     } else {
-        Write-Log "FAIL: HypervisorPresent = False. CPU virtualisation disabled in BIOS/UEFI." "WARN"
-        $checks.Add("CHECK0_HYPERVISOR=FAIL:FirmwareVirtDisabled")
-        $checks.Add("REMAINING_CHECKS=SKIPPED:HypervisorNotPresent")
-        $issues.Add("CHECK0: Firmware virtualisation (VT-x/AMD-V) disabled. Enable in BIOS/UEFI. Script cannot fix this.")
-        try {
-            Write-EventLog -LogName $EventLog -Source $EventSource -EventId 1001 -EntryType Warning `
-                -Message "Claude Cowork NON-COMPLIANT on $env:COMPUTERNAME. HypervisorPresent=False. BIOS intervention required." `
-                -ErrorAction SilentlyContinue
-        } catch {}
-        Write-IntuneOutput -IssueCount $issues.Count -CheckResults $checks -IssueList $issues
-        Exit 1
+        $fw = (Get-CimInstance -ClassName Win32_Processor -ErrorAction SilentlyContinue | Select-Object -First 1).VirtualizationFirmwareEnabled
+        if ($fw -eq $false) {
+            Write-Log "FAIL: Firmware virtualisation disabled (VirtualizationFirmwareEnabled=False, HypervisorPresent=False). BIOS/UEFI change required." "WARN"
+            $checks.Add("CHECK0_HYPERVISOR=FAIL:FirmwareVirtDisabled")
+            $checks.Add("REMAINING_CHECKS=SKIPPED:FirmwareVirtDisabled")
+            $issues.Add("CHECK0: Firmware virtualisation (VT-x/AMD-V) disabled in BIOS/UEFI. Manual BIOS change required - script cannot fix this.")
+            try {
+                Write-EventLog -LogName $EventLog -Source $EventSource -EventId 1001 -EntryType Warning `
+                    -Message "Claude Cowork NON-COMPLIANT on $env:COMPUTERNAME. Firmware virt disabled. BIOS intervention required." -ErrorAction SilentlyContinue
+            } catch {}
+            Write-IntuneOutput -IssueCount $issues.Count -CheckResults $checks -IssueList $issues
+            Exit 1
+        } else {
+            Write-Log "INFO: HypervisorPresent=False but firmware virt not confirmed disabled (VirtualizationFirmwareEnabled=$fw). Hyper-V likely just not enabled yet. Continuing."
+            $checks.Add("CHECK0_HYPERVISOR=INFO:NotEnabledYet")
+        }
     }
 } catch {
-    Write-Log "WARN: Win32_ComputerSystem query failed  -  $_. Continuing with remaining checks." "WARN"
+    Write-Log "WARN: Win32_ComputerSystem query failed  -  $_. Continuing." "WARN"
     $checks.Add("CHECK0_HYPERVISOR=UNKNOWN:QueryFailed")
 }
 
 # ===========================================================================
 # CHECK 0b: Guest VM without nested virtualisation
-#
-# HypervisorPresent=True passes CHECK 0 regardless of whether this machine
-# is a bare-metal host or a guest VM. The distinguishing signal is:
-#   - Guest integration services present (vmicheartbeat etc.) = this is a guest
-#   - vmcompute absent = either nested virt not exposed by parent, OR Hyper-V features
-#     were disabled on this guest (e.g. by Windows Update)
-#
-# We distinguish these by checking Hyper-V feature state:
-#   - Features Disabled = fixable by remediation (do not gate-exit)
-#   - Features absent/unknown + vmcompute missing = likely parent host issue (gate-exit)
-#
-# Note: vmms (Hyper-V Manager stack) is NOT checked here. Cowork only needs
-# vmcompute; vmms may be absent on working devices.
 # ===========================================================================
 Write-Log "--- CHECK 0b: Guest VM / nested virtualisation"
 $guestIntegrationSvcs = @("vmicheartbeat","vmicshutdown","vmickvpexchange","vmicvss","vmicguestinterface")
-$isGuestVM       = $null -ne ($guestIntegrationSvcs | Where-Object { (Get-Service -Name $_ -ErrorAction SilentlyContinue).Status -eq "Running" })
+$isGuestVM        = $null -ne ($guestIntegrationSvcs | Where-Object { (Get-Service -Name $_ -ErrorAction SilentlyContinue).Status -eq "Running" })
 $vmcomputePresent = $null -ne (Get-Service -Name "vmcompute" -ErrorAction SilentlyContinue)
 
 if ($isGuestVM -and -not $vmcomputePresent) {
-    # Check if Hyper-V features exist but are merely disabled (fixable) vs truly absent (parent host issue)
-    $hvFeatureState = (Get-WindowsOptionalFeature -Online -FeatureName "Microsoft-Hyper-V" -ErrorAction SilentlyContinue).State
+    $hvFeatureState = Get-FeatureState -Name "Microsoft-Hyper-V"
     if ($hvFeatureState -eq "Disabled") {
-        Write-Log "INFO: Guest VM without vmcompute but Microsoft-Hyper-V is Disabled (not absent). Features were likely disabled by a Windows Update. Remediation can re-enable them. Continuing checks."
+        Write-Log "INFO: Guest VM without vmcompute but Microsoft-Hyper-V is Disabled (not absent). Remediation can re-enable. Continuing."
         $checks.Add("CHECK0b_NESTEDVIRT=WARN:GuestVMHyperVDisabled:RemediationCanFix")
     } else {
-        $msg = "This machine is a Hyper-V guest VM, vmcompute is absent, and Hyper-V features are not in a recoverable state (feature state: $hvFeatureState). Nested virt may not be exposed by the parent host. Parent host fix: Set-VMProcessor -VMName <VMName> -ExposeVirtualizationExtensions `$true. On Azure: resize to Dv3/Ev3 or higher SKU."
+        $msg = "Guest VM without nested virt. vmcompute absent, Hyper-V state '$hvFeatureState'. Parent host fix: Set-VMProcessor -ExposeVirtualizationExtensions `$true (Azure: Dv3/Ev3+)."
         Write-Log "FAIL: $msg" "WARN"
         $checks.Add("CHECK0b_NESTEDVIRT=FAIL:GuestVMNoNestedVirt")
         $checks.Add("REMAINING_CHECKS=SKIPPED:NestedVirtNotAvailable")
-        $issues.Add("CHECK0b: Guest VM without nested virt. Parent host change required  -  script cannot fix.")
+        $issues.Add("CHECK0b: Guest VM without nested virt. Parent host change required - script cannot fix.")
         try {
             Write-EventLog -LogName $EventLog -Source $EventSource -EventId 1001 -EntryType Warning `
-                -Message "Claude Cowork NON-COMPLIANT on $env:COMPUTERNAME. Guest VM, nested virt not enabled. Parent host intervention required." `
-                -ErrorAction SilentlyContinue
+                -Message "Claude Cowork NON-COMPLIANT on $env:COMPUTERNAME. Guest VM, nested virt not enabled." -ErrorAction SilentlyContinue
         } catch {}
         Write-IntuneOutput -IssueCount $issues.Count -CheckResults $checks -IssueList $issues
         Exit 1
     }
 } elseif ($isGuestVM -and $vmcomputePresent) {
-    Write-Log "INFO: Guest VM detected but vmcompute is present  -  nested virt is enabled. Continuing checks."
+    Write-Log "INFO: Guest VM detected but vmcompute present - nested virt enabled. Continuing."
     $checks.Add("CHECK0b_NESTEDVIRT=PASS:GuestVMWithNestedVirt")
 } else {
-    Write-Log "PASS: Bare-metal host (no guest integration services detected)"
+    Write-Log "PASS: Bare-metal host."
     $checks.Add("CHECK0b_NESTEDVIRT=PASS:BareMetal")
 }
 
 # ===========================================================================
-# CHECK 1: Virtual Machine Platform Windows feature
+# CHECK 1 + 1b: Required Windows features
 # ===========================================================================
-Write-Log "--- CHECK 1: Virtual Machine Platform feature"
-try {
-    $vmp = Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform -ErrorAction Stop
-    if ($vmp.State -ne "Enabled") {
-        Write-Log "FAIL: VirtualMachinePlatform state = $($vmp.State)" "WARN"
-        $checks.Add("CHECK1_VMP=FAIL:State=$($vmp.State)")
-        $issues.Add("CHECK1: VirtualMachinePlatform not enabled (state: $($vmp.State)). Reboot required after fix.")
+Write-Log "--- CHECK 1/1b: Required features"
+$requiredFeatures = @("VirtualMachinePlatform","Microsoft-Hyper-V","Microsoft-Hyper-V-Services","Microsoft-Hyper-V-Hypervisor")
+foreach ($feat in $requiredFeatures) {
+    $state = Get-FeatureState -Name $feat
+    if ($state -eq "Enabled") {
+        Write-Log "PASS: $feat = Enabled"
+        $checks.Add("FEATURE_${feat}=PASS")
+    } elseif ($pendingReboot) {
+        Write-Log "PENDING: $feat = $state (servicing reboot pending)" "WARN"
+        $checks.Add("FEATURE_${feat}=PENDING:$state")
+        $issues.Add("FEATURE: $feat not yet Enabled (state: $state). Servicing reboot pending - completes after restart.")
     } else {
-        Write-Log "PASS: VirtualMachinePlatform = Enabled"
-        $checks.Add("CHECK1_VMP=PASS")
+        Write-Log "FAIL: $feat = $state" "WARN"
+        $checks.Add("FEATURE_${feat}=FAIL:$state")
+        $issues.Add("FEATURE: $feat not enabled (state: $state). Remediation will enable; reboot required.")
     }
-} catch {
-    Write-Log "FAIL: VirtualMachinePlatform query error  -  $_" "WARN"
-    $checks.Add("CHECK1_VMP=FAIL:QueryError")
-    $issues.Add("CHECK1: VirtualMachinePlatform query failed: $_")
 }
 
 # ===========================================================================
-# CHECK 1b: Full Hyper-V feature stack
+# CHECK 2 + 2b: Required services (vmcompute, HNS)
 #
-# VirtualMachinePlatform alone is not sufficient. Cowork requires the full
-# Hyper-V stack: Microsoft-Hyper-V (core), Microsoft-Hyper-V-Services, and
-# Microsoft-Hyper-V-Hypervisor. Without these, vmms and vmcompute cannot
-# exist as services regardless of VirtualMachinePlatform state.
-# Confirmed required by reference machine (JCPC-8CC0380SN9, v1.1.7053).
+# Only vmcompute is required for Cowork; vmms is intentionally NOT checked.
+# If a reboot is pending, absent services are the expected "awaiting reboot"
+# stage rather than a hard failure.
 # ===========================================================================
-Write-Log "--- CHECK 1b: Hyper-V feature stack (Microsoft-Hyper-V, -Services, -Hypervisor)"
-$requiredHVFeatures = @(
-    "Microsoft-Hyper-V",
-    "Microsoft-Hyper-V-Services",
-    "Microsoft-Hyper-V-Hypervisor"
-)
-foreach ($feat in $requiredHVFeatures) {
-    try {
-        $f = Get-WindowsOptionalFeature -Online -FeatureName $feat -ErrorAction Stop
-        if ($f.State -ne "Enabled") {
-            Write-Log "FAIL: $feat state = $($f.State)" "WARN"
-            $checks.Add("CHECK1b_${feat}=FAIL:State=$($f.State)")
-            $issues.Add("CHECK1b: $feat not enabled (state: $($f.State)). Reboot required after fix.")
+Write-Log "--- CHECK 2/2b: Services (vmcompute, HNS)"
+foreach ($svcName in @("vmcompute","HNS")) {
+    $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+    if ($null -eq $svc) {
+        if ($pendingReboot) {
+            Write-Log "PENDING: $svcName not present yet (servicing reboot pending)." "WARN"
+            $checks.Add("SVC_${svcName}=PENDING:NotPresentAwaitingReboot")
+            $issues.Add("SERVICE: $svcName not present yet. Servicing reboot pending - registers after restart.")
         } else {
-            Write-Log "PASS: $feat = Enabled"
-            $checks.Add("CHECK1b_${feat}=PASS")
+            Write-Log "FAIL: $svcName not found." "WARN"
+            $checks.Add("SVC_${svcName}=FAIL:NotFound")
+            $issues.Add("SERVICE: $svcName not found. Hyper-V stack incomplete.")
         }
-    } catch {
-        Write-Log "FAIL: $feat query error  -  $_" "WARN"
-        $checks.Add("CHECK1b_${feat}=FAIL:QueryError")
-        $issues.Add("CHECK1b: $feat query failed: $_")
-    }
-}
-
-# ===========================================================================
-# CHECK 2: Hyper-V services (vmcompute)
-#
-# Only vmcompute is required for Cowork. vmms (Hyper-V Manager stack) is NOT
-# needed and may legitimately be absent on working devices.
-# ===========================================================================
-Write-Log "--- CHECK 2: Hyper-V services (vmcompute)"
-foreach ($svcName in @("vmcompute")) {
-    try {
-        $svc = Get-Service -Name $svcName -ErrorAction Stop
-        if ($svc.Status -ne "Running") {
-            Write-Log "FAIL: $svcName status = $($svc.Status)" "WARN"
-            $checks.Add("CHECK2_${svcName}=FAIL:$($svc.Status)")
-            $issues.Add("CHECK2: Service $svcName not running (status: $($svc.Status))")
-        } else {
-            Write-Log "PASS: $svcName = Running"
-            $checks.Add("CHECK2_${svcName}=PASS")
-        }
-    } catch {
-        Write-Log "FAIL: $svcName not found  -  $_" "WARN"
-        $checks.Add("CHECK2_${svcName}=FAIL:NotFound")
-        $issues.Add("CHECK2: Service $svcName not found: $_")
-    }
-}
-
-# ===========================================================================
-# CHECK 2b: HNS service
-#
-# The Host Network Service is required for cowork-vm-nat network creation.
-# On the reference machine: HNS = Running | StartType=Manual.
-# If HNS is stopped, the HNS network checks below will silently fail.
-# ===========================================================================
-Write-Log "--- CHECK 2b: HNS service"
-try {
-    $hns = Get-Service -Name "HNS" -ErrorAction Stop
-    if ($hns.Status -ne "Running") {
-        Write-Log "FAIL: HNS status = $($hns.Status)" "WARN"
-        $checks.Add("CHECK2b_HNS=FAIL:$($hns.Status)")
-        $issues.Add("CHECK2b: HNS service not running (status: $($hns.Status)). cowork-vm-nat network cannot be created.")
+    } elseif ($svc.Status -ne "Running") {
+        Write-Log "FAIL: $svcName status = $($svc.Status)" "WARN"
+        $checks.Add("SVC_${svcName}=FAIL:$($svc.Status)")
+        $issues.Add("SERVICE: $svcName not running (status: $($svc.Status)). Remediation will start it.")
     } else {
-        Write-Log "PASS: HNS = Running"
-        $checks.Add("CHECK2b_HNS=PASS")
+        Write-Log "PASS: $svcName = Running"
+        $checks.Add("SVC_${svcName}=PASS")
     }
-} catch {
-    Write-Log "FAIL: HNS service not found  -  $_" "WARN"
-    $checks.Add("CHECK2b_HNS=FAIL:NotFound")
-    $issues.Add("CHECK2b: HNS service not found. Hyper-V networking stack may be missing.")
 }
 
 # ===========================================================================
-# CHECK 8: 172.16.0.0/24 subnet conflict on host adapters
-# Flag only  -  remediation cannot safely fix a subnet conflict
+# CHECK 8: 172.16.0.0/24 subnet conflict (flag only - cannot auto-remap)
 # ===========================================================================
 Write-Log "--- CHECK 8: 172.16.0.0/24 subnet conflict"
 $conflictAdapters = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
@@ -294,7 +300,7 @@ if ($conflictAdapters) {
     $detail = ($conflictAdapters | ForEach-Object { "$($_.InterfaceAlias)=$($_.IPAddress)" }) -join ','
     Write-Log "WARN: Subnet conflict on 172.16.0.0/24  -  $detail" "WARN"
     $checks.Add("CHECK8_SUBNET=WARN:Conflict:$detail")
-    $issues.Add("CHECK8: Subnet conflict on 172.16.0.0/24 ($detail). Cowork NAT will fail. Manual review required  -  script cannot safely remap Cowork subnet.")
+    $issues.Add("CHECK8: Subnet conflict on 172.16.0.0/24 ($detail). Cowork NAT will fail. Manual review - script cannot safely remap.")
 } else {
     Write-Log "PASS: No 172.16.0.0/24 conflict"
     $checks.Add("CHECK8_SUBNET=PASS")
@@ -308,7 +314,6 @@ Write-Log "Detection complete. Issues: $($issues.Count)"
 foreach ($i in $issues) { Write-Log "  ISSUE: $i" "WARN" }
 Write-Log "========================================="
 
-# Write to Windows Event Log
 $eventMsg  = "Claude Cowork detection on $env:COMPUTERNAME.`nIssues: $($issues.Count)`n"
 $eventMsg += if ($issues.Count -gt 0) { $issues -join "`n" } else { "All checks passed." }
 $eventMsg += "`n`nChecks:`n$($checks -join "`n")"
@@ -321,18 +326,24 @@ try {
     Write-Log "WARN: Event log write failed  -  $_" "WARN"
 }
 
-# Emit structured stdout for Intune Remediations portal
 Write-IntuneOutput -IssueCount $issues.Count -CheckResults $checks -IssueList $issues
 
-# Write the prereqs-ready flag when all checks pass so install_claude.ps1 can proceed.
+# Write the prereqs-ready flag only when everything passed (truly READY).
 if ($issues.Count -eq 0) {
-    $FlagFile = "$LogDir\ClaudePrereqsReady.flag"
     if (-not (Test-Path $FlagFile)) {
         "Prereqs confirmed ready on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') by $env:COMPUTERNAME" | Out-File -FilePath $FlagFile -Encoding UTF8
         Write-Log "FLAG WRITTEN: $FlagFile"
     } else {
         Write-Log "FLAG EXISTS: $FlagFile (no action needed)"
     }
+
+    # Prereqs are READY -> clean up any stale reboot-prompt artefacts so the user-context
+    # prompt task cannot fire (and force restarts) off a leftover pending flag. Runs as
+    # SYSTEM, so it reliably removes the flag and unregisters the task even when the
+    # remediation itself never re-ran (device converged via detection alone).
+    Remove-Item $RebootPendingFlag -Force -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName "ClaudeCoworkRebootPrompt" -Confirm:$false -ErrorAction SilentlyContinue
+    Remove-Item "$env:ProgramData\AnthropicClaude\CoworkRebootPrompt.ps1" -Force -ErrorAction SilentlyContinue
 }
 
 if ($issues.Count -gt 0) { Exit 1 } else { Exit 0 }
