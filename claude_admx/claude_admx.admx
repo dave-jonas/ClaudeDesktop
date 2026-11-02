@@ -25,6 +25,9 @@
     <category name="Claude_Features" displayName="$(string.Claude_Features_Category)">
       <parentCategory ref="Claude" />
     </category>
+    <category name="Claude_Security" displayName="$(string.Claude_Security_Category)">
+      <parentCategory ref="Claude" />
+    </category>
   </categories>
 
   <policies>
@@ -146,6 +149,24 @@
                  valueName="isClaudeCodeForDesktopEnabled"
                  minValue="0"
                  maxValue="1" />
+      </elements>
+    </policy>
+
+    <!-- ═══════════════════════════════════════════════
+         LOGIN / ORGANIZATION POLICIES
+         ═══════════════════════════════════════════════ -->
+
+    <policy name="ForceLoginOrgUUID"
+            class="Machine"
+            displayName="$(string.ForceLoginOrgUUID)"
+            explainText="$(string.ForceLoginOrgUUID_Explain)"
+            presentation="$(presentation.ForceLoginOrgUUID)"
+            key="SOFTWARE\Policies\Claude">
+      <parentCategory ref="Claude_Security" />
+      <supportedOn ref="SUPPORTED_WIN10_AND_LATER" />
+      <elements>
+        <text id="ForceLoginOrgUUID_Value"
+              valueName="forceLoginOrgUUID" />
       </elements>
     </policy>
 
