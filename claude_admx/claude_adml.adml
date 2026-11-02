@@ -18,6 +18,7 @@
       <string id="Claude_Category">Claude Desktop</string>
       <string id="Claude_Updates_Category">Updates</string>
       <string id="Claude_Features_Category">Features</string>
+      <string id="Claude_Security_Category">Login and Organization</string>
 
       <!-- ═══════════════════════════════════════════════
            UPDATE POLICIES
@@ -103,6 +104,25 @@ Set to 0 to disable Claude Code in the desktop app.
 Registry key: HKLM\SOFTWARE\Policies\Claude\isClaudeCodeForDesktopEnabled
       </string>
 
+      <!-- ═══════════════════════════════════════════════
+           LOGIN / ORGANIZATION POLICIES
+           ═══════════════════════════════════════════════ -->
+
+      <string id="ForceLoginOrgUUID">Restrict Login to Organization (Org Lockdown)</string>
+      <string id="ForceLoginOrgUUID_Explain">
+Restricts sign-in to Claude Desktop to accounts that belong to the specified Claude organization.
+
+Single organization: enter the UUID, e.g. 00000000-0000-0000-0000-000000000000. The organization is pre-selected during login.
+
+Multiple organizations: enter a JSON array of UUIDs as text, e.g. ["00000000-0000-0000-0000-000000000000","11111111-1111-1111-1111-111111111111"]. Any listed organization is accepted; none is pre-selected.
+
+Login fails if the authenticated account does not belong to a listed organization. If not configured, users can sign in with any account.
+
+The value is stored as a string (REG_SZ), not REG_MULTI_SZ. Restart Claude Desktop after changing it.
+
+Registry key: HKLM\SOFTWARE\Policies\Claude\forceLoginOrgUUID
+      </string>
+
     </stringTable>
 
     <presentationTable>
@@ -133,6 +153,12 @@ Registry key: HKLM\SOFTWARE\Policies\Claude\isClaudeCodeForDesktopEnabled
 
       <presentation id="IsClaudeCodeForDesktopEnabled">
         <decimalTextBox refId="IsClaudeCodeForDesktopEnabled_Value" defaultValue="1">Enable Claude Code for Desktop (0 = disabled, 1 = enabled):</decimalTextBox>
+      </presentation>
+
+      <presentation id="ForceLoginOrgUUID">
+        <textBox refId="ForceLoginOrgUUID_Value">
+          <label>Allowed organization UUID, or JSON array of UUIDs:</label>
+        </textBox>
       </presentation>
 
     </presentationTable>
